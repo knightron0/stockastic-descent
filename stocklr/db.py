@@ -8,6 +8,11 @@ def already_done(conn, window_end):
     return row is not None
 
 
+def run_anchor(conn):
+    """window_start of the first successful real job: the fixed start of the run (None before it begins)."""
+    return conn.execute("select min(window_start) from jobs where status = 'ok' and not is_test").fetchone()[0]
+
+
 def start_job(conn, window_start, window_end, ran_eval, is_test, mapper_specs):
     return conn.execute(
         "insert into jobs (window_start, window_end, ran_eval, is_test, mappers) values (%s, %s, %s, %s, %s) returning id",

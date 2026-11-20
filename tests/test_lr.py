@@ -21,3 +21,95 @@ def test_bars_to_steps():
     assert len(idx) == 240 and idx[0] == 0 and idx[-1] == 56
     with pytest.raises(ValueError):
         L.bars_to_steps(0)
+
+
+
+# ---- Envelope (live schedule)
+
+def _env(**kw):
+    return L.build_schedule({"name": "envelope", "eta_max": 3e-3, "floor": 0.1, "warmup": 0.02, "max_rise": 0.5, **kw})
+
+
+def test_envelope_midpoint_and_bounds():
+    e, st = _env(), {}
+    for step in range(1, 400):
+        lr, _ = e(step, 0.5, st)
+    assert lr == pytest.approx(3e-3 * (0.1 + 0.9 * 0.5))            # eta_max (f + (1-f)/2) at s = 1/2
+    assert e(5000, 1.0, {})[0] == pytest.approx(3e-3)                # s -> 1: eta_max
+    assert e(5000, 0.0, {})[0] == pytest.approx(3e-4)                # s -> 0: floor * eta_max
+
+
+def test_envelope_warmup_is_2_percent_linear():
+    e = _env()
+    N = L.TOTAL_STEPS
+    assert e(1, 1.0, {})[0] == pytest.approx(3e-3 / (0.02 * N))
+    assert e(int(0.01 * N), 1.0, {})[0] == pytest.approx(3e-3 * int(0.01 * N) / (0.02 * N))
+    assert e(int(0.02 * N) + 1, 1.0, {})[0] == pytest.approx(3e-3)   # full after 2%, and no cooldown:
+    assert e(N, 1.0, {})[0] == pytest.approx(3e-3)
+
+
+def test_envelope_caps_rises_but_not_falls():
+    e, st = _env(), {}
+    N = L.TOTAL_STEPS
+    _, s0 = e(1000, 0.1, st)
+    _, s1 = e(1001, 0.9, st)
+    assert s0 == 0.1 and s1 == pytest.approx(0.1 + 0.5 / (0.01 * N))
+    for step in range(1002, 1002 + int(0.016 * N)):                 # 0.8 rise takes 1.6% of the run
+        _, s = e(step, 0.9, st)
+    assert s == pytest.approx(0.9)
+    _, s = e(5000, 0.2, st)                                           # drops pass straight through
+    assert s == 0.2
+
+
+def test_envelope_state_carries_across_jobs():
+    sig = np.clip(0.5 + 0.4 * np.sin(np.arange(960) / 25), 0, 1)
+    one = _env(); st = {}
+    a = [one(i + 1, v, st)[0] for i, v in enumerate(sig)]
+    two = _env(); st2 = {}; b = []
+    for job in range(4):                                             # 4 hourly jobs, state persisted between
+        st2 = dict(st2)
+        b += [two(job * 240 + i + 1, v, st2)[0] for i, v in enumerate(sig[job * 240:(job + 1) * 240])]
+    assert np.allclose(a, b)
+
+
+def test_wsd_schedule_matches_legacy():
+    w = L.build_schedule({"name": "wsd"})
+    assert w(5000, 1.3, {})[0] == pytest.approx(L.ETA0 * 1.3)
+
+
+def test_unknown_schedule():
+    with pytest.raises(KeyError):
+        L.build_schedule({"name": "nope"})
+
+
+def test_envelope_without_warmup_starts_at_full_lr():
+    e = _env(warmup=0.0)
+    assert e(1, 0.5, {})[0] == pytest.approx(3e-3 * (0.1 + 0.9 * 0.5))
+
+
+def test_constant_schedule():
+    c = L.build_schedule({"name": "constant", "peak_lr": 3e-3})
+    assert c(1, 1.0, {})[0] == pytest.approx(3e-3)
+    assert c(9000, 0.9, {})[0] == pytest.approx(2.7e-3)
+
+
+def test_live_formula_is_peak_times_price_over_start():
+    import numpy as np
+    from stocklr import mappers as M
+    from stocklr.config import SCHEDULE, TICKER_MAPPER
+    p = np.array([100.0, 110.0, 95.0, 100.0])
+    m = M.safe_multipliers(M.build(TICKER_MAPPER), M.Bars(np.arange(4), p, np.ones(4)))
+    sched = L.build_schedule(SCHEDULE)
+    lrs = [sched(i + 1, v, {})[0] for i, v in enumerate(m)]
+    assert np.allclose(lrs, 3e-3 * p / p[0])
+
+
+def test_constant_schedule_clips_lr():
+    from stocklr.config import SCHEDULE
+    c = L.build_schedule(SCHEDULE)
+    assert c(1, 0.0, {})[0] == 1e-6            # price -> 0: floor
+    assert c(1, 1e-9, {})[0] == 1e-6
+    assert c(1, 5.0, {})[0] == pytest.approx(1.5e-2)   # price x5: no ceiling
+    assert c(1, 1.1, {})[0] == pytest.approx(3.3e-3)
+    capped = L.build_schedule({**SCHEDULE, "max_lr": 6e-3})
+    assert capped(1, 5.0, {})[0] == 6e-3

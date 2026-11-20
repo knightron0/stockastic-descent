@@ -20,7 +20,6 @@ VOL = "/vol"
 HF = "https://huggingface.co/datasets/kothasuhas/dl_alchemy_seq9p6m_context1024/resolve/main"
 TRAIN_BYTES = 600_000 * 1024 * 2   # first 600k sequences, uint16
 STEPS_PER_JOB = 240                # runs, tickers and the price -> LR mapper are in stocklr/config.py
-HISTORY_DAYS = 8                   # calendar days of bars fetched for the trailing-average multiplier
 secrets = modal.Secret.from_name("stock-lr-secrets")
 
 
@@ -107,8 +106,8 @@ def run_job(window=None, test=False, force=False):
     from datetime import datetime, timedelta, timezone
     import numpy as np, psycopg
     from stocklr import db, mappers
-    from stocklr.config import MAPPER_SPECS, PRICE_SOURCE, RUNS
-    from stocklr.lr import bars_to_steps
+    from stocklr.config import HISTORY_WARMUP_DAYS, MAPPER_SPECS, PRICE_SOURCE, RUNS, SCHEDULE
+    from stocklr.lr import bars_to_steps, build_schedule
     from stocklr.market import ET, fetch_bars, job_window
     from stocklr.train import Tokens, commit_checkpoints, train_hour
 
@@ -117,18 +116,23 @@ def run_job(window=None, test=False, force=False):
     if win is None:
         print("outside market hours: nothing to do"); return {"status": "no-window"}
     start, end = win
-    run_eval = test or end.astimezone(ET).hour % 2 == 0          # 10, 12, 14, 16 ET -> every 2 hours
+    run_eval = True                                               # validation after every job (every 240 steps)
     ckpt_dir = f"{VOL}/ckpt_test" if test else f"{VOL}/ckpt"
     prefix = "test-" if test else ""
     conn = psycopg.connect(os.environ["SUPABASE_DB_URL"], autocommit=True, connect_timeout=15)
     if not test and not force and db.already_done(conn, end):
         print(f"window ending {end} already trained: skipping"); return {"status": "duplicate"}
     built = {r: mappers.build(MAPPER_SPECS[r]) for r in RUNS}          # fail fast on a bad config
+    schedule = build_schedule(SCHEDULE)
     TICKERS = sorted({PRICE_SOURCE[r] for r in RUNS if PRICE_SOURCE[r]})
-    job_id = db.start_job(conn, start, end, run_eval, test, MAPPER_SPECS)
+    # history always starts at the same anchor (run start - 30 days), so the EMA state is identical to
+    # one updated bar by bar since then, no matter which hour this job is.
+    run_start = None if test else db.run_anchor(conn)
+    history_from = (run_start or start) - timedelta(days=HISTORY_WARMUP_DAYS)
+    job_id = db.start_job(conn, start, end, run_eval, test, {**MAPPER_SPECS, "_schedule": SCHEDULE})
     print(f"job {job_id}: window {start.astimezone(ET):%a %H:%M}-{end.astimezone(ET):%H:%M} ET, eval={run_eval}, test={test}")
     try:
-        bars = fetch_bars(TICKERS, end - timedelta(days=HISTORY_DAYS), end,
+        bars = fetch_bars(TICKERS, history_from, end,
                           os.environ["ALPACA_KEY_ID"], os.environ["ALPACA_SECRET"])
         window_bars = {s: [b for b in bars[s] if b["ts"] >= start] for s in TICKERS}
         n_bars = {s: len(v) for s, v in window_bars.items()}
@@ -152,13 +156,15 @@ def run_job(window=None, test=False, force=False):
         for r in RUNS:
             src = PRICE_SOURCE[r]
             n = n_bars[src] if src else 0
-            if not src:                       # e.g. BASELINE: mapper sees a flat dummy series
+            if not src:                       # run without a ticker: mapper sees a flat dummy series
                 flat = mappers.Bars.from_rows([{"ts": t, "close": 1.0} for t in even_ts])
                 mults[r], step_ts[r] = mappers.safe_multipliers(built[r], flat), even_ts
                 continue
-            if n == 0:                        # ticker didn't trade this hour (halt): hold at 1.0
-                print(f"WARNING {r}: no {src} bars this hour, multiplier held at 1.0")
-                mults[r], step_ts[r] = np.ones(STEPS_PER_JOB), even_ts
+            if n == 0:                        # no bars this hour (halt): hold the last value, as when closed
+                hist = mappers.safe_multipliers(built[r], mappers.Bars.from_rows(bars[src])) if bars[src] else []
+                held = float(hist[-1]) if len(hist) else getattr(built[r], "neutral", 1.0)
+                print(f"WARNING {r}: no {src} bars this hour, holding signal at {held:.3f}")
+                mults[r], step_ts[r] = np.full(STEPS_PER_JOB, held), even_ts
                 continue
             m = mappers.safe_multipliers(built[r], mappers.Bars.from_rows(bars[src]))[-n:]
             idx = bars_to_steps(n, STEPS_PER_JOB)
@@ -168,7 +174,7 @@ def run_job(window=None, test=False, force=False):
         os.makedirs(ckpt_dir, exist_ok=True)
         results = {}
         for r in RUNS:
-            res = train_hour(prefix + r, mults[r], tokens, ckpt_dir, run_eval)
+            res = train_hour(prefix + r, mults[r], schedule, tokens, ckpt_dir, run_eval)
             results[r] = res
             if res["done"]:
                 print(f"{r}: run complete at step {res['start_step']}, nothing to train"); continue
@@ -200,7 +206,8 @@ def run_job(window=None, test=False, force=False):
 
 
 # The real thing. Schedule only takes effect after `modal deploy`.
-@app.function(image=image, gpu="H100", volumes={VOL: vol}, secrets=[secrets], timeout=1800, retries=0,
+# GPU fallbacks: H100 first; if none is free, the next one in the list.
+@app.function(image=image, gpu=["H100", "A100-80GB", "L40S"], volumes={VOL: vol}, secrets=[secrets], timeout=1800, retries=0,
               schedule=modal.Cron("17 10-16 * * 1-5", timezone="America/New_York"))
 def hourly():
     return run_job()
@@ -229,12 +236,12 @@ def test_job(start_iso: str, end_iso: str, keep: bool = False):
         print("evals:", evals)
         checks = {
             "job ok": status[0] == "ok",
-            "5 runs x 240 steps": len(steps) == 5 and all(r[1] == STEPS_PER_JOB for r in steps),
-            "5 evals": len(evals) == 5,
+            "4 runs x 240 steps": len(steps) == 4 and all(r[1] == STEPS_PER_JOB for r in steps),
+            "4 evals": len(evals) == 4,
             "bars pulled": sum((status[1] or {}).values()) > 0,
-            "baseline mult == 1": all(r[6] == r[7] == 1.0 for r in steps if r[0].endswith("BASELINE")),
             "mapper specs recorded": q("select mappers is not null from jobs where id=%s")[0][0],
-            "multipliers within (0.5, 2)": all(0.5 < r[6] and r[7] < 2.0 for r in steps),
+            "lr >= 1e-6": all(1e-6 <= r[4] for r in steps),
+            "lr positive": all(0 < r[4] for r in steps),
         }
         if not keep:
             db.delete_job(conn, jid)
@@ -260,3 +267,222 @@ def main(start: str = "", end: str = "", keep: bool = False):
     print(f"end-to-end test on {datetime.fromisoformat(start).astimezone(ET):%a %b %d %H:%M}-"
           f"{datetime.fromisoformat(end).astimezone(ET):%H:%M} ET")
     test_job.remote(start, end, keep)
+
+
+@app.function(image=image, secrets=[secrets], timeout=600)
+def preview_lrs(first_day: str, last_day: str):
+    """CPU only, no training: replay the cron's LR computation over past trading days (same mapper, schedule,
+    history anchor and 240-steps-per-job mapping). Returns per-step LRs + per-bar prices/signals."""
+    import os
+    from datetime import date, datetime, timedelta
+    import numpy as np
+    from stocklr import mappers
+    from stocklr.config import HISTORY_WARMUP_DAYS, MAPPER_SPECS, PRICE_SOURCE, RUNS, SCHEDULE
+    from stocklr.lr import bars_to_steps, build_schedule
+    from stocklr.market import ET, fetch_bars, job_window
+
+    d0, d1 = date.fromisoformat(first_day), date.fromisoformat(last_day)
+    windows, d = [], d0
+    while d <= d1:
+        for h in range(10, 17):
+            w = job_window(datetime(d.year, d.month, d.day, h, 17, tzinfo=ET))
+            if w: windows.append(w)
+        d += timedelta(days=1)
+    tickers = sorted({PRICE_SOURCE[r] for r in RUNS if PRICE_SOURCE[r]})
+    bars = fetch_bars(tickers, windows[0][0] - timedelta(days=HISTORY_WARMUP_DAYS), windows[-1][1],
+                      os.environ["ALPACA_KEY_ID"], os.environ["ALPACA_SECRET"])
+    built = {r: mappers.build(MAPPER_SPECS[r]) for r in RUNS}
+    sigs = {s: mappers.safe_multipliers(built[next(r for r in RUNS if PRICE_SOURCE[r] == s)], mappers.Bars.from_rows(bars[s]))
+            for s in tickers}
+    out = {r: {"lr": [], "s": [], "s_tilde": [], "ts": []} for r in RUNS}
+    state = {r: {} for r in RUNS}
+    sched = build_schedule(SCHEDULE)
+    step = 0
+    for start, end in windows:
+        for r in RUNS:
+            src = PRICE_SOURCE[r]
+            if src:
+                idx_all = [i for i, b in enumerate(bars[src]) if start <= b["ts"] < end]
+                if not idx_all: continue
+                pick = [idx_all[i] for i in bars_to_steps(len(idx_all))]
+                vals, tss = sigs[src][pick], [bars[src][i]["ts"].isoformat() for i in pick]
+            else:
+                vals = np.full(240, built[r].neutral); tss = [(start + (end - start) * i / 240).isoformat() for i in range(240)]
+            for i, v in enumerate(vals):
+                lr, st = sched(step + i + 1, float(v), state[r])
+                out[r]["lr"].append(lr); out[r]["s"].append(float(v)); out[r]["s_tilde"].append(st); out[r]["ts"].append(tss[i])
+        step += 240
+    prices = {s: {"ts": [b["ts"].isoformat() for b in bars[s] if b["ts"] >= windows[0][0]],
+                  "close": [b["close"] for b in bars[s] if b["ts"] >= windows[0][0]],
+                  "s": [float(v) for b, v in zip(bars[s], sigs[s]) if b["ts"] >= windows[0][0]]} for s in tickers}
+    return {"runs": out, "prices": prices, "n_steps": step, "history_bars": {s: len(v) for s, v in bars.items()}}
+
+
+@app.local_entrypoint()
+def preview(first: str = "2026-11-13", last: str = "2026-11-19", out: str = "research/lr_preview.json"):
+    import json
+    res = preview_lrs.remote(first, last)
+    open(out, "w").write(json.dumps(res))
+    print(f"{res['n_steps']} steps, history bars {res['history_bars']} -> {out}")
+
+
+@app.function(image=image, secrets=[secrets], timeout=1800)
+def replay_week(first_day: str = "2026-11-09"):
+    """Publish a new independent training replay to Supabase Storage."""
+    import json
+    import os
+    import uuid
+    from datetime import datetime, timedelta, timezone
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+    from stocklr.config import HISTORY_WARMUP_DAYS, MAPPER_SPECS, PRICE_SOURCE, SCHEDULE
+    from stocklr.market import ET, fetch_bars
+    from stocklr.lr import TOTAL_STEPS
+    from stocklr.replay import REPLAY_RUNS, replay_batches
+
+    start = datetime.strptime(first_day, "%Y-%m-%d").replace(hour=9, minute=30, tzinfo=ET)
+    if start.weekday() != 0:
+        raise ValueError("first_day must be a Monday")
+    end = (start + timedelta(days=4)).replace(hour=16, minute=0)
+    symbols = [PRICE_SOURCE[r] for r in REPLAY_RUNS]
+    history = fetch_bars(symbols, (start - timedelta(days=HISTORY_WARMUP_DAYS)).astimezone(timezone.utc),
+                         end.astimezone(timezone.utc),
+                         os.environ["ALPACA_KEY_ID"], os.environ["ALPACA_SECRET"])
+    origin = os.environ["SUPABASE_URL"].rstrip("/")
+    key = os.environ["SUPABASE_SERVICE_KEY"]
+    bucket = "stock-lr-replays"
+    replay_id = uuid.uuid4().hex
+    def storage(path, payload=None):
+        headers = {"Authorization": "Bearer " + key, "apikey": key, "Content-Type": "application/json",
+                   "Cache-Control": "max-age=0", "x-upsert": "true"}
+        body = json.dumps(payload, allow_nan=False, separators=(",", ":")).encode() if payload is not None else None
+        for attempt in range(4):
+            try:
+                with urlopen(Request(origin + "/storage/v1/" + path, data=body, headers=headers), timeout=30) as res:
+                    return json.load(res)
+            except HTTPError as exc:
+                if exc.code < 500 and exc.code != 429 or attempt == 3:
+                    raise
+            except URLError:
+                if attempt == 3:
+                    raise
+            time.sleep(2 ** attempt)
+
+    try:
+        info = storage("bucket/" + bucket)
+    except HTTPError as exc:
+        detail = exc.read()
+        if exc.code != 404 and b"Bucket not found" not in detail:
+            raise
+        storage("bucket", {"id": bucket, "name": bucket, "public": True})
+        info = storage("bucket/" + bucket)
+    if not info.get("public"):
+        raise ValueError("Replay bucket is private")
+    prefix = f"object/{bucket}/{replay_id}/"
+    chunks = []
+    for step, batch in replay_batches(history, start, end):
+        stamps = [row["ts"] for row in batch["steps"]]
+        now = datetime.now(timezone.utc).isoformat()
+        batch["jobs"].append(dict(id=step, started_at=now, finished_at=now, window_start=min(stamps),
+                                  window_end=max(stamps), status="ok", ran_eval=bool(batch["evals"]),
+                                  n_bars=None, duration_s=None, error=None, mappers={**MAPPER_SPECS, "_schedule": SCHEDULE}))
+        storage(prefix + f"{step}.json", batch)
+        chunks.append(step)
+        storage(prefix + "manifest.json", {"chunks": chunks, "synthetic_losses": True})
+        if step == 480:
+            print(f"Replay: ?replay={origin.split('//')[1].split('.')[0]}/{replay_id}", flush=True)
+        print(f"Published step {step}", flush=True)
+        if step < TOTAL_STEPS:
+            time.sleep(5)
+
+
+@app.function(image=image, gpu="B200", volumes={VOL: vol}, secrets=[secrets], timeout=3600)
+def backfill(day: str):
+    """Run the real (non-test) hourly job for every finished window of a past trading day, in order.
+    Already-trained windows are skipped, so it's safe to re-run. Do NOT run while the cron is mid-job."""
+    from datetime import date, datetime, timedelta, timezone
+    from stocklr.market import ET, job_window
+    d = date.fromisoformat(day)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=16)
+    wins = [w for h in range(10, 17) if (w := job_window(datetime(d.year, d.month, d.day, h, 17, tzinfo=ET))) and w[1] <= cutoff]
+    print(f"{day}: {len(wins)} finished windows")
+    out = []
+    for w in wins:
+        res = run_job(window=w)
+        print(f"  {w[0].astimezone(ET):%H:%M}-{w[1].astimezone(ET):%H:%M} ET -> {res['status']}")
+        out.append(res)
+        if res["status"] not in ("ok", "duplicate", "skipped"):
+            raise RuntimeError(f"stopping: {res}")
+    return out
+
+
+@app.local_entrypoint()
+def backfill_day(day: str):
+    for r in backfill.remote(day):
+        print(r)
+
+
+TABLES = ["jobs", "prices", "steps", "evals"]
+
+
+@app.function(image=image, volumes={VOL: vol}, secrets=[secrets], timeout=1800)
+def backup_and_reset(tag: str, wipe: bool = False):
+    """Back up every Supabase row + /vol/ckpt + /vol/prices to /vol/backups/<tag>/, verify it, and (wipe=True)
+    then delete those rows and directories so the next cron job starts a fresh run at step 1.
+    /vol/data (training sequences) and /vol/backups are never touched."""
+    import json, os, shutil
+    import psycopg
+    out = f"{VOL}/backups/{tag}"
+    if os.path.exists(out):
+        raise SystemExit(f"{out} already exists; pick another tag")
+    os.makedirs(out)
+    dump = {}
+    with psycopg.connect(os.environ["SUPABASE_DB_URL"], autocommit=True) as conn:
+        running = conn.execute("select count(*) from jobs where status = 'running'").fetchone()[0]
+        if running:
+            raise SystemExit(f"{running} job(s) still running; try again after they finish")
+        for t in TABLES:
+            cur = conn.execute(f"select * from {t}")
+            cols = [c.name for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            dump[t] = rows
+            with open(f"{out}/{t}.json", "w") as f:
+                json.dump(rows, f, default=str)
+        for d in ("ckpt", "prices"):
+            if os.path.exists(f"{VOL}/{d}"):
+                shutil.copytree(f"{VOL}/{d}", f"{out}/{d}")
+        vol.commit()
+        # verify before deleting anything
+        for t in TABLES:
+            n = len(json.load(open(f"{out}/{t}.json")))
+            assert n == len(dump[t]), f"backup mismatch on {t}"
+        ck = sorted(os.listdir(f"{out}/ckpt")) if os.path.exists(f"{out}/ckpt") else []
+        for name in ck:
+            assert os.path.getsize(f"{out}/ckpt/{name}") == os.path.getsize(f"{VOL}/ckpt/{name}"), name
+        summary = {t: len(dump[t]) for t in TABLES} | {"checkpoints": ck}
+        print("backed up + verified:", summary, "->", out)
+        if wipe:
+            for t in ["steps", "evals", "prices", "jobs"]:          # children first (job_id foreign keys)
+                conn.execute(f"delete from {t}")
+            for d in ("ckpt", "ckpt_test", "prices"):
+                shutil.rmtree(f"{VOL}/{d}", ignore_errors=True)
+            vol.commit()
+            left = {t: conn.execute(f"select count(*) from {t}").fetchone()[0] for t in TABLES}
+            print("wiped. rows left:", left, "| volume now:", sorted(os.listdir(VOL)))
+    return {"summary": summary, "dump": dump}
+
+
+@app.local_entrypoint()
+def reset(tag: str, wipe: bool = False):
+    """uv run modal run modal_app.py::reset --tag <name> [--wipe]   (also saves a local copy under backups/<tag>/)"""
+    import csv, json, pathlib
+    res = backup_and_reset.remote(tag, wipe)
+    local = pathlib.Path("backups") / tag
+    local.mkdir(parents=True, exist_ok=True)
+    for t, rows in res["dump"].items():
+        with open(local / f"{t}.csv", "w", newline="") as f:
+            if rows:
+                w = csv.DictWriter(f, fieldnames=list(rows[0])); w.writeheader()
+                for r in rows:
+                    w.writerow({k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in r.items()})
+    print("local copy:", local.resolve(), res["summary"])

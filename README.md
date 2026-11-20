@@ -1,2 +1,2 @@
-# stock-lr
-learning rate from $ANT, $TESLA for a small LLM
+# stockastic descent
+stock-derived learning rate to train a small LLM

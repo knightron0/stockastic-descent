@@ -52,10 +52,11 @@ def new_model(device):
     return model, opt
 
 
-def train_hour(name, mults, tokens, ckpt_dir, run_eval, device="cuda"):
-    """Load `name`'s checkpoint, run len(mults) steps with lr = ETA0 * wsd(step) * mult, and save to
-    <name>.pt.tmp (call commit_checkpoints after the DB write succeeds). Returns per-step records."""
-    from stocklr.lr import ETA0, TOTAL_STEPS, wsd
+def train_hour(name, mults, schedule, tokens, ckpt_dir, run_eval, device="cuda"):
+    """Load `name`'s checkpoint, run len(mults) steps with lr = schedule(step, mult, state), and save to
+    <name>.pt.tmp (call commit_checkpoints after the DB write succeeds). The schedule's state (e.g. the
+    envelope's rise cap) lives in the checkpoint, so it carries across hourly jobs. Returns per-step records."""
+    from stocklr.lr import TOTAL_STEPS
     t0 = time.perf_counter()
     path = Path(ckpt_dir) / f"{name}.pt"
     model, opt = new_model(device)
@@ -69,13 +70,16 @@ def train_hour(name, mults, tokens, ckpt_dir, run_eval, device="cuda"):
         return {"name": name, "done": True, "start_step": start_step, "steps": [], "val_loss": None}
 
     mults = [float(m) for m in mults][: TOTAL_STEPS - start_step]
+    sched_state = dict(state.get("sched", {}))
     torch.cuda.synchronize(); t1 = time.perf_counter()
     losses = torch.empty(len(mults), device=device)
-    lrs = []
+    lrs, logged = [], []
     for i, m in enumerate(mults):
         step = start_step + i + 1                      # 1-based global step
-        lr = ETA0 * wsd(step) * m
-        lrs.append(lr)
+        lr, shown = schedule(step, m, sched_state)
+        if not (np.isfinite(lr) and lr >= 0):
+            raise ValueError(f"{name}: schedule produced lr={lr} at step {step}")
+        lrs.append(lr); logged.append(shown)
         for g in opt.param_groups:
             g["lr"] = lr
         loss = lm_loss(model, tokens.train_batch(step - 1, device))
@@ -91,10 +95,11 @@ def train_hour(name, mults, tokens, ckpt_dir, run_eval, device="cuda"):
 
     vl = val_loss(model, tokens, device) if run_eval else None
     state["step"] = start_step + len(mults)
+    state["sched"] = sched_state
     state["hour"] = state.get("hour", 0) + 1
     torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "state": state}, f"{path}.tmp")
     return {"name": name, "done": False, "start_step": start_step, "end_step": state["step"],
-            "steps": [(start_step + i + 1, lrs[i], mults[i], losses[i]) for i in range(len(mults))],
+            "steps": [(start_step + i + 1, lrs[i], logged[i], losses[i]) for i in range(len(mults))],
             "val_loss": vl, "load_s": load_s, "train_s": train_s, "ms_per_step": 1000 * train_s / max(1, len(mults)),
             "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9}
 

@@ -8,8 +8,12 @@ Contract (enforced by tests/test_mappers.py for every registered mapper):
   * input: Bars (oldest first; may include several days of history before the current hour)
   * output: np.ndarray, same length as the bars, one multiplier per bar
   * causal: the value at bar i may only depend on bars[: i + 1]
-  * should stay within [MIN_MULT, MAX_MULT]; `safe_multipliers` clips + checks anyway, so a buggy
-    mapper can't blow up training
+  * should stay within the mapper's own `bounds` (default [MIN_MULT, MAX_MULT]); `safe_multipliers`
+    clips + checks anyway, so a buggy mapper can't blow up training
+  * `neutral`: the value it returns for a perfectly flat price (default 1.0)
+
+What the multiplier *means* depends on the schedule in stocklr/lr.py: WSD multiplies the LR by it;
+Envelope treats it as the sigmoid signal s in (0, 1).
 
 Adding one:
     @register("my_idea")
@@ -63,7 +67,7 @@ def build(spec: dict):
 
 
 def safe_multipliers(mapper, bars: Bars) -> np.ndarray:
-    """Run a mapper and guarantee a usable output: right length, finite, clipped to [MIN_MULT, MAX_MULT]."""
+    """Run a mapper and guarantee a usable output: right length, finite, clipped to the mapper's bounds."""
     if len(bars) == 0:
         return np.ones(0)
     if not np.all(np.isfinite(bars.close)) or np.any(bars.close <= 0):
@@ -73,7 +77,8 @@ def safe_multipliers(mapper, bars: Bars) -> np.ndarray:
         raise ValueError(f"{mapper.name}: returned shape {m.shape}, expected ({len(bars)},)")
     if not np.all(np.isfinite(m)):
         raise ValueError(f"{mapper.name}: returned non-finite multipliers")
-    return np.clip(m, MIN_MULT, MAX_MULT)
+    lo, hi = getattr(mapper, "bounds", (MIN_MULT, MAX_MULT))
+    return np.clip(m, lo, hi)
 
 
 # ---------------------------------------------------------------- helpers
@@ -94,8 +99,11 @@ def ewm(x, span):
 
 @register("constant")
 class Constant:
-    """Always 1.0: the WSD baseline."""
+    """Always `value`: the baseline (1.0 under WSD, 0.5 = the sigmoid midpoint under Envelope)."""
+    bounds = (0.0, 10.0)
+
     def __init__(self, value=1.0):
+        self.neutral = float(value)
         self.value = value
 
     def __call__(self, bars):
@@ -119,9 +127,55 @@ class Detrended:
 class PriceRatio:
     """(price / first price in the history) ** k. Follows the chart directly but DRIFTS over long horizons:
     kept for experiments, not recommended for the live run."""
+    bounds = (0.0, float("inf"))     # no multiplier clip: the schedule clips the LR itself (min_lr / max_lr)
     def __init__(self, k=5.0, smooth=10):
         self.k, self.smooth = k, smooth
 
     def __call__(self, bars):
         p = ewm(bars.close, self.smooth)
         return (p / p[0]) ** self.k
+
+
+@register("ema_sigmoid")
+class EmaSigmoid:
+    """Running-EMA sigmoid signal s_t in (0, 1).
+
+        x_t = ln P_t,   a = 0.5 ** (1 / (h * B))
+        W_t = a W_{t-1} + 1,  S1_t = a S1_{t-1} + x_t,  S2_t = a S2_{t-1} + x_t^2       (W, S1, S2 start at 0)
+        mu_t = S1_t / W_t,  sigma_t = sqrt(max(S2_t / W_t - mu_t^2, 0))
+        z_t = (x_t - mu_t) / (w sigma_t),  s_t = 1 / (1 + exp(-z_t))   (s_t = 1/2 when sigma_t = 0)
+
+    h = half-life in trading days, B = bars per session (390 for 1-minute bars), w = width.
+    Bars must be regular-session only, oldest first. mu/sigma depend on where the history starts, so
+    the job always feeds history from a fixed anchor (>= 30 days before the run starts).
+    Implementation detail: x is shifted by x_0 before accumulating. mu and sigma are shift-invariant, so
+    the result is the same, but it avoids cancellation in S2/W - mu^2 (x ~ 5, variance ~ 1e-5).
+    """
+    bounds = (0.0, 1.0)
+    neutral = 0.5
+
+    def __init__(self, half_life_days=5.0, width=1.0, bars_per_session=390):
+        if half_life_days <= 0 or width <= 0 or bars_per_session <= 0:
+            raise ValueError("half_life_days, width and bars_per_session must be > 0")
+        self.h, self.w, self.B = float(half_life_days), float(width), int(bars_per_session)
+
+    def __call__(self, bars):
+        x = np.log(np.asarray(bars.close, dtype=float))
+        if len(x) == 0:
+            return x
+        x = x - x[0]
+        a = 0.5 ** (1.0 / (self.h * self.B))
+        out = np.empty_like(x)
+        W = S1 = S2 = 0.0
+        for t, xt in enumerate(x):
+            W = a * W + 1.0
+            S1 = a * S1 + xt
+            S2 = a * S2 + xt * xt
+            mu = S1 / W
+            sigma = np.sqrt(max(S2 / W - mu * mu, 0.0))
+            if sigma <= 1e-12:
+                out[t] = 0.5
+            else:
+                z = (xt - mu) / (self.w * sigma)
+                out[t] = 1.0 / (1.0 + np.exp(-z))
+        return out
