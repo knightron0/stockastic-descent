@@ -2,7 +2,7 @@
 
 The mapper (stocklr/mappers.py) decides how price moves; the schedule decides what that means for the LR
 over the run. Schedules may keep state across steps (e.g. Envelope's rise cap); that state is stored in
-each run's checkpoint so it carries across hourly jobs.
+each run's checkpoint so it carries across jobs.
 
     sched = build_schedule(SCHEDULE)
     lr, logged = sched(step, raw_value, state)      # step is 1-based and global; state is a dict
@@ -10,6 +10,7 @@ each run's checkpoint so it carries across hourly jobs.
 import numpy as np
 
 TOTAL_STEPS = 9_375            # one pass over 600k sequences at batch 64: the run stops here
+STEPS_PER_JOB = 60            # one 15-minute job = 15 one-minute bars x 4 steps per bar
 
 # legacy WSD constants (kept for the "wsd" schedule)
 ETA0 = 3e-3
@@ -83,8 +84,8 @@ def build_schedule(spec: dict):
     return SCHEDULES[name](**spec)
 
 
-def bars_to_steps(n_bars: int, n_steps: int = 240):
-    """Index of the bar each step uses: 60 bars -> 4 steps per bar, 30 bars -> 8."""
+def bars_to_steps(n_bars: int, n_steps: int = STEPS_PER_JOB):
+    """Index of the bar each step uses: 15 bars -> 4 steps per bar; missing minutes spread the rest."""
     if n_bars <= 0:
         raise ValueError("need at least one bar")
     return (np.arange(n_steps) * n_bars // n_steps).astype(int)

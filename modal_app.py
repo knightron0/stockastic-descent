@@ -3,8 +3,8 @@
   uv run modal run modal_app.py::prepare_data     # once: 600k train seqs + val into the Volume (CPU)
   uv run modal run modal_app.py::apply_schema     # create/upgrade Supabase tables (idempotent)
   uv run modal run modal_app.py::check_setup      # secrets, Alpaca, Supabase reachability
-  uv run modal run modal_app.py                   # end-to-end test on the last full hour (isolated, cleaned up)
-  uv run modal deploy modal_app.py                # turn on the cron (weekdays 10:17-16:17 ET)
+  uv run modal run modal_app.py                   # end-to-end test on the last full 15-min window (isolated, cleaned up)
+  uv run modal deploy modal_app.py                # turn on the cron (weekdays every 15 min, 10:02-16:17 ET)
 """
 import time
 import modal
@@ -19,7 +19,9 @@ image = (
 VOL = "/vol"
 HF = "https://huggingface.co/datasets/kothasuhas/dl_alchemy_seq9p6m_context1024/resolve/main"
 TRAIN_BYTES = 600_000 * 1024 * 2   # first 600k sequences, uint16
-STEPS_PER_JOB = 240                # runs, tickers and the price -> LR mapper are in stocklr/config.py
+from stocklr.lr import STEPS_PER_JOB  # 60 per 15-min job; runs, tickers and the price -> LR mapper are in stocklr/config.py
+EVAL_EVERY = 60                    # val loss at every multiple of this step, plus at each job's end (= once per job)
+JOB_TIMEOUT_S = 720                # must stay under the 15-min cron gap so jobs can never overlap
 secrets = modal.Secret.from_name("stock-lr-secrets")
 
 
@@ -100,7 +102,7 @@ def apply_schema():
 
 
 def run_job(window=None, test=False, force=False):
-    """One hourly job. window=(start_utc, end_utc) overrides the clock (used by tests/backfills).
+    """One 15-minute job. window=(start_utc, end_utc) overrides the clock (used by tests/backfills).
     test=True writes run names 'test-*' and checkpoints under /vol/ckpt_test so real state is untouched."""
     import csv, os, traceback
     from datetime import datetime, timedelta, timezone
@@ -109,24 +111,26 @@ def run_job(window=None, test=False, force=False):
     from stocklr.config import HISTORY_WARMUP_DAYS, MAPPER_SPECS, PRICE_SOURCE, RUNS, SCHEDULE
     from stocklr.lr import bars_to_steps, build_schedule
     from stocklr.market import ET, fetch_bars, job_window
-    from stocklr.train import Tokens, commit_checkpoints, train_hour
+    from stocklr.train import Tokens, commit_checkpoints, train_window
 
     t0 = time.perf_counter()
     win = window or job_window(datetime.now(timezone.utc))
     if win is None:
         print("outside market hours: nothing to do"); return {"status": "no-window"}
     start, end = win
-    run_eval = True                                               # validation after every job (every 240 steps)
+    run_eval = True                                               # validation every EVAL_EVERY steps + at job end
     ckpt_dir = f"{VOL}/ckpt_test" if test else f"{VOL}/ckpt"
     prefix = "test-" if test else ""
     conn = psycopg.connect(os.environ["SUPABASE_DB_URL"], autocommit=True, connect_timeout=15)
-    if not test and not force and db.already_done(conn, end):
+    if not test and not force and db.already_done(conn, start, end):
         print(f"window ending {end} already trained: skipping"); return {"status": "duplicate"}
+    if not test and (busy := db.job_in_flight(conn)):
+        print(f"job {busy} is still running: skipping this window"); return {"status": "busy"}
     built = {r: mappers.build(MAPPER_SPECS[r]) for r in RUNS}          # fail fast on a bad config
     schedule = build_schedule(SCHEDULE)
     TICKERS = sorted({PRICE_SOURCE[r] for r in RUNS if PRICE_SOURCE[r]})
     # history always starts at the same anchor (run start - 30 days), so the EMA state is identical to
-    # one updated bar by bar since then, no matter which hour this job is.
+    # one updated bar by bar since then, no matter which window this job is.
     run_start = None if test else db.run_anchor(conn)
     history_from = (run_start or start) - timedelta(days=HISTORY_WARMUP_DAYS)
     job_id = db.start_job(conn, start, end, run_eval, test, {**MAPPER_SPECS, "_schedule": SCHEDULE})
@@ -160,10 +164,10 @@ def run_job(window=None, test=False, force=False):
                 flat = mappers.Bars.from_rows([{"ts": t, "close": 1.0} for t in even_ts])
                 mults[r], step_ts[r] = mappers.safe_multipliers(built[r], flat), even_ts
                 continue
-            if n == 0:                        # no bars this hour (halt): hold the last value, as when closed
+            if n == 0:                        # no bars this window (halt): hold the last value, as when closed
                 hist = mappers.safe_multipliers(built[r], mappers.Bars.from_rows(bars[src])) if bars[src] else []
                 held = float(hist[-1]) if len(hist) else getattr(built[r], "neutral", 1.0)
-                print(f"WARNING {r}: no {src} bars this hour, holding signal at {held:.3f}")
+                print(f"WARNING {r}: no {src} bars this window, holding signal at {held:.3f}")
                 mults[r], step_ts[r] = np.full(STEPS_PER_JOB, held), even_ts
                 continue
             m = mappers.safe_multipliers(built[r], mappers.Bars.from_rows(bars[src]))[-n:]
@@ -174,13 +178,13 @@ def run_job(window=None, test=False, force=False):
         os.makedirs(ckpt_dir, exist_ok=True)
         results = {}
         for r in RUNS:
-            res = train_hour(prefix + r, mults[r], schedule, tokens, ckpt_dir, run_eval)
+            res = train_window(prefix + r, mults[r], schedule, tokens, ckpt_dir, run_eval, EVAL_EVERY)
             results[r] = res
             if res["done"]:
                 print(f"{r}: run complete at step {res['start_step']}, nothing to train"); continue
             print(f"{r}: steps {res['start_step'] + 1}-{res['end_step']}  lr {min(x[1] for x in res['steps']):.2e}-"
                   f"{max(x[1] for x in res['steps']):.2e}  loss {res['steps'][-1][3]:.3f}"
-                  + (f"  val {res['val_loss']:.3f}" if res['val_loss'] is not None else "")
+                  + "".join(f"  val@{s} {v:.3f}" for s, v in res["evals"])
                   + f"  ({res['ms_per_step']:.0f} ms/step)")
 
         step_rows, eval_rows = [], []
@@ -188,8 +192,8 @@ def run_job(window=None, test=False, force=False):
             ts_list = step_ts[r]
             for i, (step, lr, mult, loss) in enumerate(res["steps"]):
                 step_rows.append((prefix + r, step, ts_list[i], lr, mult, loss, job_id))
-            if res["val_loss"] is not None:
-                eval_rows.append((prefix + r, res["end_step"], res["val_loss"], job_id))
+            for step, vl in res["evals"]:
+                eval_rows.append((prefix + r, step, vl, job_id))
         db.insert_steps(conn, step_rows)
         db.insert_evals(conn, eval_rows)
         commit_checkpoints(ckpt_dir, [prefix + r for r in RUNS])
@@ -207,9 +211,11 @@ def run_job(window=None, test=False, force=False):
 
 # The real thing. Schedule only takes effect after `modal deploy`.
 # GPU fallbacks: H100 first; if none is free, the next one in the list.
-@app.function(image=image, gpu=["H100", "A100-80GB", "L40S"], volumes={VOL: vol}, secrets=[secrets], timeout=1800, retries=0,
-              schedule=modal.Cron("17 10-16 * * 1-5", timezone="America/New_York"))
-def hourly():
+# Fires at :02/:17/:32/:47, training the window that ended 17 min earlier (bars are 15 min delayed):
+# 10:02 -> 9:30-9:45 ... 16:17 -> 15:45-16:00. 16:32 and 16:47 find no window and exit at once.
+@app.function(image=image, gpu=["H100", "A100-80GB", "L40S"], volumes={VOL: vol}, secrets=[secrets], timeout=JOB_TIMEOUT_S,
+              retries=0, schedule=modal.Cron("2,17,32,47 10-16 * * 1-5", timezone="America/New_York"))
+def every_15_min():
     return run_job()
 
 
@@ -236,8 +242,8 @@ def test_job(start_iso: str, end_iso: str, keep: bool = False):
         print("evals:", evals)
         checks = {
             "job ok": status[0] == "ok",
-            "4 runs x 240 steps": len(steps) == 4 and all(r[1] == STEPS_PER_JOB for r in steps),
-            "4 evals": len(evals) == 4,
+            f"4 runs x {STEPS_PER_JOB} steps": len(steps) == 4 and all(r[1] == STEPS_PER_JOB for r in steps),
+            f"4 runs x {STEPS_PER_JOB // EVAL_EVERY} evals": len(evals) == 4 * (STEPS_PER_JOB // EVAL_EVERY),
             "bars pulled": sum((status[1] or {}).values()) > 0,
             "mapper specs recorded": q("select mappers is not null from jobs where id=%s")[0][0],
             "lr >= 1e-6": all(1e-6 <= r[4] for r in steps),
@@ -256,13 +262,13 @@ def test_job(start_iso: str, end_iso: str, keep: bool = False):
 
 @app.local_entrypoint()
 def main(start: str = "", end: str = "", keep: bool = False):
-    """Default: test on the most recent full regular-session hour that is at least 16 minutes old."""
+    """Default: test on the most recent full 15-minute regular-session window that is at least 16 minutes old."""
     from datetime import datetime, timedelta, timezone
-    from stocklr.market import ET, job_window
+    from stocklr.market import ET, JOB_MINUTES, job_window
     if not start:
-        t = datetime.now(timezone.utc) - timedelta(minutes=16)
-        while (w := job_window(t)) is None or (w[1] - w[0]) < timedelta(hours=1):
-            t -= timedelta(hours=1)
+        t = datetime.now(timezone.utc)
+        while (w := job_window(t)) is None or (w[1] - w[0]) < timedelta(minutes=JOB_MINUTES):
+            t -= timedelta(minutes=JOB_MINUTES)
         start, end = w[0].isoformat(), w[1].isoformat()
     print(f"end-to-end test on {datetime.fromisoformat(start).astimezone(ET):%a %b %d %H:%M}-"
           f"{datetime.fromisoformat(end).astimezone(ET):%H:%M} ET")
@@ -272,21 +278,19 @@ def main(start: str = "", end: str = "", keep: bool = False):
 @app.function(image=image, secrets=[secrets], timeout=600)
 def preview_lrs(first_day: str, last_day: str):
     """CPU only, no training: replay the cron's LR computation over past trading days (same mapper, schedule,
-    history anchor and 240-steps-per-job mapping). Returns per-step LRs + per-bar prices/signals."""
+    history anchor and steps-per-job mapping). Returns per-step LRs + per-bar prices/signals."""
     import os
     from datetime import date, datetime, timedelta
     import numpy as np
     from stocklr import mappers
     from stocklr.config import HISTORY_WARMUP_DAYS, MAPPER_SPECS, PRICE_SOURCE, RUNS, SCHEDULE
     from stocklr.lr import bars_to_steps, build_schedule
-    from stocklr.market import ET, fetch_bars, job_window
+    from stocklr.market import ET, fetch_bars, job_windows_for_day
 
     d0, d1 = date.fromisoformat(first_day), date.fromisoformat(last_day)
     windows, d = [], d0
     while d <= d1:
-        for h in range(10, 17):
-            w = job_window(datetime(d.year, d.month, d.day, h, 17, tzinfo=ET))
-            if w: windows.append(w)
+        windows += job_windows_for_day(d)
         d += timedelta(days=1)
     tickers = sorted({PRICE_SOURCE[r] for r in RUNS if PRICE_SOURCE[r]})
     bars = fetch_bars(tickers, windows[0][0] - timedelta(days=HISTORY_WARMUP_DAYS), windows[-1][1],
@@ -307,11 +311,12 @@ def preview_lrs(first_day: str, last_day: str):
                 pick = [idx_all[i] for i in bars_to_steps(len(idx_all))]
                 vals, tss = sigs[src][pick], [bars[src][i]["ts"].isoformat() for i in pick]
             else:
-                vals = np.full(240, built[r].neutral); tss = [(start + (end - start) * i / 240).isoformat() for i in range(240)]
+                vals = np.full(STEPS_PER_JOB, built[r].neutral)
+                tss = [(start + (end - start) * i / STEPS_PER_JOB).isoformat() for i in range(STEPS_PER_JOB)]
             for i, v in enumerate(vals):
                 lr, st = sched(step + i + 1, float(v), state[r])
                 out[r]["lr"].append(lr); out[r]["s"].append(float(v)); out[r]["s_tilde"].append(st); out[r]["ts"].append(tss[i])
-        step += 240
+        step += STEPS_PER_JOB
     prices = {s: {"ts": [b["ts"].isoformat() for b in bars[s] if b["ts"] >= windows[0][0]],
                   "close": [b["close"] for b in bars[s] if b["ts"] >= windows[0][0]],
                   "s": [float(v) for b, v in zip(bars[s], sigs[s]) if b["ts"] >= windows[0][0]]} for s in tickers}
@@ -398,20 +403,19 @@ def replay_week(first_day: str = "2026-11-09"):
 
 @app.function(image=image, gpu="B200", volumes={VOL: vol}, secrets=[secrets], timeout=3600)
 def backfill(day: str):
-    """Run the real (non-test) hourly job for every finished window of a past trading day, in order.
+    """Run the real (non-test) 15-minute job for every finished window of a past trading day, in order.
     Already-trained windows are skipped, so it's safe to re-run. Do NOT run while the cron is mid-job."""
     from datetime import date, datetime, timedelta, timezone
-    from stocklr.market import ET, job_window
-    d = date.fromisoformat(day)
+    from stocklr.market import ET, job_windows_for_day
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=16)
-    wins = [w for h in range(10, 17) if (w := job_window(datetime(d.year, d.month, d.day, h, 17, tzinfo=ET))) and w[1] <= cutoff]
+    wins = [w for w in job_windows_for_day(date.fromisoformat(day)) if w[1] <= cutoff]
     print(f"{day}: {len(wins)} finished windows")
     out = []
     for w in wins:
         res = run_job(window=w)
         print(f"  {w[0].astimezone(ET):%H:%M}-{w[1].astimezone(ET):%H:%M} ET -> {res['status']}")
         out.append(res)
-        if res["status"] not in ("ok", "duplicate", "skipped"):
+        if res["status"] not in ("ok", "duplicate", "skipped"):   # "busy": the cron is mid-job, stop
             raise RuntimeError(f"stopping: {res}")
     return out
 

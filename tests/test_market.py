@@ -1,5 +1,5 @@
-from datetime import datetime, timezone
-from stocklr.market import ET, fetch_bars, job_window
+from datetime import date, datetime, timezone
+from stocklr.market import ET, fetch_bars, job_window, job_windows_for_day
 
 
 def et(*a):
@@ -7,33 +7,37 @@ def et(*a):
 
 
 def test_windows_through_a_trading_day():
-    # Thu 2026-11-19
-    w = job_window(et(2026, 11, 19, 10, 17))
-    assert w[0].astimezone(ET) == et(2026, 11, 19, 9, 30) and w[1].astimezone(ET) == et(2026, 11, 19, 10, 0)
-    w = job_window(et(2026, 11, 19, 11, 17))
-    assert w[0].astimezone(ET) == et(2026, 11, 19, 10, 0) and w[1].astimezone(ET) == et(2026, 11, 19, 11, 0)
-    w = job_window(et(2026, 11, 19, 16, 17))
-    assert w[0].astimezone(ET) == et(2026, 11, 19, 15, 0) and w[1].astimezone(ET) == et(2026, 11, 19, 16, 0)
+    # Thu 2026-11-19; the cron fires at :02/:17/:32/:47 and trains the window that ended 17 min earlier
+    def win(h, m):
+        s, e = job_window(et(2026, 11, 19, h, m))
+        return s.astimezone(ET).strftime("%H:%M"), e.astimezone(ET).strftime("%H:%M")
+    assert win(10, 2) == ("09:30", "09:45")
+    assert win(10, 17) == ("09:45", "10:00")
+    assert win(11, 47) == ("11:15", "11:30")
+    assert win(16, 17) == ("15:45", "16:00")
+    assert win(10, 15) == ("09:30", "09:45")        # 10:00-10:15's bars aren't all out until 10:16
 
 
 def test_no_window_outside_hours():
-    assert job_window(et(2026, 11, 19, 9, 17)) is None     # before the open
-    assert job_window(et(2026, 11, 19, 17, 17)) is None    # after the close
+    for h, m in [(9, 47), (10, 0), (16, 32), (16, 47), (17, 17)]:
+        assert job_window(et(2026, 11, 19, h, m)) is None, (h, m)   # first window not out yet / after close
     assert job_window(et(2026, 11, 21, 12, 17)) is None    # Saturday
     assert job_window(et(2026, 11, 22, 12, 17)) is None    # Sunday
 
 
-def test_cron_hours_map_to_seven_windows():
-    wins = [job_window(et(2026, 11, 19, h, 17)) for h in range(10, 17)]
-    assert all(wins)
-    total = sum((e - s).total_seconds() for s, e in wins) / 60
-    assert total == 390                                     # exactly one full session, no gaps or overlap
+def test_cron_fires_map_to_26_full_windows():
+    fires = [et(2026, 11, 19, h, m) for h in range(10, 17) for m in (2, 17, 32, 47)]
+    wins = [w for t in fires if (w := job_window(t))]
+    assert len(wins) == 26
+    assert all((e - s).total_seconds() == 15 * 60 for s, e in wins)   # every window is a full 15 bars
     assert all(wins[i][1] == wins[i + 1][0] for i in range(len(wins) - 1))
+    assert wins == job_windows_for_day(date(2026, 11, 19))
+    assert job_windows_for_day(date(2026, 11, 21)) == []
 
 
 def test_dst_is_handled():
     # Mon 2026-03-09 is after US DST starts (Mar 8): 9:30 ET = 13:30 UTC
-    s, e = job_window(et(2026, 3, 9, 10, 17))
+    s, e = job_window(et(2026, 3, 9, 10, 2))
     assert s == datetime(2026, 3, 9, 13, 30, tzinfo=timezone.utc)
 
 
@@ -63,3 +67,13 @@ def test_fetch_bars_paginates_and_filters():
     assert [b["close"] for b in out["NVDA"]] == [2.0, 3.0]
     assert [b["close"] for b in out["ANT"]] == [5.0]
     assert out["SPCX"] == []
+
+
+def test_fetch_bars_sends_utc_for_non_utc_window():
+    calls = []
+    def fake_get(url, headers):
+        calls.append(url)
+        return {"bars": {"NVDA": [_bar("2026-11-19T19:30:00Z", 1.0)]}, "next_page_token": None}   # 14:30 ET
+    out = fetch_bars(["NVDA"], et(2026, 11, 19, 14, 0), et(2026, 11, 19, 15, 0), "k", "s", get=fake_get)
+    assert "start=2026-11-19T19%3A00%3A00Z" in calls[0] and "end=2026-11-19T20%3A00%3A00Z" in calls[0]
+    assert [b["close"] for b in out["NVDA"]] == [1.0]

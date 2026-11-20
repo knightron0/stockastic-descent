@@ -1,4 +1,4 @@
-"""Alpaca 1-minute bars (SIP feed) and the trading-hour window each job covers."""
+"""Alpaca 1-minute bars (SIP feed) and the 15-minute trading window each job covers."""
 import json
 import time as _time
 import urllib.error
@@ -9,22 +9,35 @@ from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 OPEN, CLOSE = time(9, 30), time(16, 0)
+JOB_MINUTES = 15               # 9:30 and 16:00 fall on quarter hours, so every window is a full 15 bars
+DATA_DELAY = timedelta(minutes=16)   # SIP bars are 15 min delayed: a window is trained 16+ min after it ends
 BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
 
 def job_window(now: datetime):
-    """The hour a job running at `now` should train on: [X-1:00, X:00) ET, clipped to 9:30-16:00.
+    """The quarter hour a job running at `now` should train on: the latest [:00|:15|:30|:45, +15 min) ET
+    window within 9:30-16:00 that ended at least DATA_DELAY ago (so its delayed bars exist).
     Returns (start, end) as UTC datetimes, or None outside market hours / on weekends."""
-    et = now.astimezone(ET)
+    et = (now - DATA_DELAY).astimezone(ET)
     if et.weekday() >= 5:
         return None
-    end = et.replace(minute=0, second=0, microsecond=0)
+    end = et.replace(minute=et.minute // JOB_MINUTES * JOB_MINUTES, second=0, microsecond=0)
     day_open = end.replace(hour=OPEN.hour, minute=OPEN.minute)
     day_close = end.replace(hour=CLOSE.hour, minute=0)
     if end <= day_open or end > day_close:
         return None
-    start = max(end - timedelta(hours=1), day_open)
+    start = max(end - timedelta(minutes=JOB_MINUTES), day_open)
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+
+def job_windows_for_day(d):
+    """Every window the cron trains on a given date (a datetime.date), in order: 26 x 15 min on a trading day."""
+    out, t = [], datetime(d.year, d.month, d.day, OPEN.hour, OPEN.minute, tzinfo=ET)
+    while (t := t + timedelta(minutes=JOB_MINUTES)).time() <= CLOSE:
+        if (w := job_window(t + DATA_DELAY)):
+            out.append(w)
+    return out
 
 
 def is_regular_session(ts: datetime) -> bool:
@@ -49,12 +62,17 @@ def _http_get(url, headers, retries=4):
             raise
 
 
+def _utc_z(dt):
+    """Alpaca wants UTC 'Z' timestamps; convert first so a window given in ET (or any offset) isn't shifted."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def fetch_bars(symbols, start, end, key_id, secret, feed="sip", get=_http_get):
     """Regular-session 1-minute bars with start <= ts < end, oldest first, for each symbol.
     Follows Alpaca's next_page_token. Returns {symbol: [{ts, open, high, low, close, volume}, ...]}."""
     headers = {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret}
     params = {"symbols": ",".join(symbols), "timeframe": "1Min", "feed": feed, "adjustment": "raw",
-              "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "start": _utc_z(start), "end": _utc_z(end),
               "limit": 10000, "sort": "asc"}
     out = {s: [] for s in symbols}
     token = None

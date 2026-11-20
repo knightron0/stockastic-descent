@@ -1,11 +1,20 @@
-"""Supabase Postgres writes for the hourly job (psycopg 3)."""
+"""Supabase Postgres writes for the 15-minute job (psycopg 3)."""
 import json
 
 
-def already_done(conn, window_end):
-    row = conn.execute("select 1 from jobs where window_end = %s and status = 'ok' and not is_test limit 1",
-                       (window_end,)).fetchone()
+def already_done(conn, window_start, window_end):
+    """True if a successful real job already covered [window_start, window_end), e.g. an older hourly job."""
+    row = conn.execute("select 1 from jobs where window_start <= %s and window_end >= %s and status = 'ok' "
+                       "and not is_test limit 1", (window_start, window_end)).fetchone()
     return row is not None
+
+
+def job_in_flight(conn, max_age_min=13):
+    """A real job still marked running and started recently enough that it may still be alive (older
+    'running' rows are containers that hit the timeout and never got to finish_job)."""
+    row = conn.execute("select id from jobs where status = 'running' and not is_test "
+                       "and started_at > now() - make_interval(mins => %s) limit 1", (max_age_min,)).fetchone()
+    return row[0] if row else None
 
 
 def run_anchor(conn):

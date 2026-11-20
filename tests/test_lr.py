@@ -15,10 +15,11 @@ def test_wsd_shape():
 
 
 def test_bars_to_steps():
-    assert list(np.bincount(L.bars_to_steps(60))) == [4] * 60
-    assert list(np.bincount(L.bars_to_steps(30))) == [8] * 30
-    idx = L.bars_to_steps(57)                # missing minutes still cover all 240 steps
-    assert len(idx) == 240 and idx[0] == 0 and idx[-1] == 56
+    assert L.STEPS_PER_JOB == 60
+    assert list(np.bincount(L.bars_to_steps(15))) == [4] * 15
+    assert list(np.bincount(L.bars_to_steps(60, 240))) == [4] * 60
+    idx = L.bars_to_steps(13)                # missing minutes still cover all 60 steps
+    assert len(idx) == 60 and idx[0] == 0 and idx[-1] == 12
     with pytest.raises(ValueError):
         L.bars_to_steps(0)
 
@@ -66,7 +67,7 @@ def test_envelope_state_carries_across_jobs():
     one = _env(); st = {}
     a = [one(i + 1, v, st)[0] for i, v in enumerate(sig)]
     two = _env(); st2 = {}; b = []
-    for job in range(4):                                             # 4 hourly jobs, state persisted between
+    for job in range(4):                                             # 4 jobs, state persisted between
         st2 = dict(st2)
         b += [two(job * 240 + i + 1, v, st2)[0] for i, v in enumerate(sig[job * 240:(job + 1) * 240])]
     assert np.allclose(a, b)
