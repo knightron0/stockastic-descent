@@ -1,0 +1,10 @@
+[project]
+name = "stock-lr"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "modal>=1.6.4",
+    "numpy>=2.5.5",
+    "torch>=2.15.0",
+]
