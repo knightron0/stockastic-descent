@@ -3,7 +3,7 @@ import { fmtET } from "./format";
 import type { Model, Series } from "./types";
 
 export interface ChartSpec {
-  series: { run: Run; data: Series; name?: string; rightAxis?: boolean }[];
+  series: { run: Run; data: Series; name?: string; rightAxis?: boolean; area?: boolean }[];
   yFmt: (v: number) => string;
   rightFmt?: (v: number) => string;
   symbol?: "none";
@@ -11,6 +11,12 @@ export interface ChartSpec {
   focus?: boolean;
   /** visible step range; defaults to the full schedule */
   xRange?: [number, number];
+}
+
+/** #rrggbb + alpha -> rgba() (ECharts draws on canvas, so CSS color-mix is not available) */
+function alpha(hex: string, a: number) {
+  const n = parseInt(hex.replace("#", ""), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
 
 /** Padded [min, max] of the series values whose step lies in [lo, hi]. */
@@ -37,20 +43,20 @@ export function buildOption(spec: ChartSpec, model: Model) {
   const c = { ink: css("--ink"), ink3: css("--ink-3"), rule: css("--rule"), panel: css("--panel") };
   const font = css("--f-body") || "sans-serif", mono = css("--f-mono") || "monospace";
   const { yFmt } = spec;
-  const axisLine = { show: true, onZero: false, lineStyle: { color: "#d8dbdf", width: 1 } };
+  const axisLine = { show: true, onZero: false, lineStyle: { color: c.rule, width: 1 } };
   const [xMin, xMax] = spec.xRange ?? [1, TOTAL_STEPS];
   const yFit = spec.focus ? fitY(spec, xMin, xMax) : null;
 
   return {
     animation: false,
     textStyle: { fontFamily: font },
-    grid: { left: 4, right: spec.rightFmt ? 8 : 22, top: 10, bottom: 4, containLabel: true },
+    grid: { left: 4, right: spec.rightFmt ? 8 : 22, top: 12, bottom: 4, containLabel: true },
     tooltip: {
       trigger: "axis", confine: true, order: "valueDesc",
       backgroundColor: c.panel, borderColor: c.rule, borderWidth: 1, padding: [8, 10],
       textStyle: { color: c.ink, fontFamily: font, fontSize: 12 },
-      extraCssText: "box-shadow: 0 6px 24px rgba(0,0,0,.18); border-radius: 8px;",
-      axisPointer: { type: "line", lineStyle: { color: c.ink3, width: 1, type: "dashed" } },
+      extraCssText: "box-shadow: 0 8px 28px rgba(16,24,40,.14); border-radius: 10px;",
+      axisPointer: { type: "line", lineStyle: { color: c.ink3, width: 1, type: [3, 3], opacity: 0.7 } },
       formatter: (params: { axisValue: number; color: string; seriesName: string; seriesIndex: number; value: [number, number] }[]) => {
         if (!params.length) return "";
         const step = Math.round(params[0].axisValue);
@@ -64,13 +70,14 @@ export function buildOption(spec: ChartSpec, model: Model) {
     xAxis: {
       type: "value", splitNumber: 5, min: xMin, max: xMax,
       axisLine, axisTick: { show: false }, splitLine: { show: false },
-      axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, showMinLabel: false, showMaxLabel: true,
+      axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, showMinLabel: false,
+        showMaxLabel: xMax === TOTAL_STEPS,            // zoomed, the max is the live step (1,260): end on a round tick
         formatter: (v: number) => v >= 1000 && v % 100 === 0 ? (v / 1000).toFixed(v % 1000 ? 1 : 0) + "k" : Math.round(v).toLocaleString() },
     },
     yAxis: [{
       type: "value", splitNumber: 4, scale: true, boundaryGap: ["4%", "4%"],
       ...(yFit ? { min: yFit[0], max: yFit[1] } : {}),
-      splitLine: { show: true, lineStyle: { color: css("--grid"), width: 1, opacity: 0.75 } },
+      splitLine: { show: true, lineStyle: { color: c.rule, width: 1, type: [3, 4] } },
       axisLine: { show: false },
       axisTick: { show: false },
       axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, showMinLabel: !yFit, showMaxLabel: !yFit, formatter: yFmt },
@@ -80,7 +87,7 @@ export function buildOption(spec: ChartSpec, model: Model) {
       splitLine: { show: false }, axisLine, axisTick: { show: false },
       axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, formatter: spec.rightFmt },
     }] : [])],
-    series: spec.series.map(({ run, data, name, rightAxis }) => {
+    series: spec.series.map(({ run, data, name, rightAxis, area }) => {
       const color = rightAxis ? c.ink3 : css(COLOR_VAR[run]);
       const pts: [number, number][] = [];
       data.forEach((v, j) => { if (v != null) pts.push([j + 1, v]); });   // only real points: sparse series stay visible
@@ -88,9 +95,12 @@ export function buildOption(spec: ChartSpec, model: Model) {
         name: name ?? run, yAxisIndex: rightAxis ? 1 : 0, type: "line", data: pts, connectNulls: true,
         sampling: spec.symbol === "none" ? undefined : "lttb",
         showSymbol: false, symbol: spec.symbol ?? "circle", symbolSize: 4,
-        lineStyle: { color, width: rightAxis ? 1.4 : 1.8, type: rightAxis ? [6, 4] : "solid" },
+        triggerLineEvent: true,   // hovering the line itself (not just a point) reports the run for cross-panel highlight
+        lineStyle: { color, width: rightAxis ? 1.4 : 2, type: rightAxis ? [5, 4] : "solid", cap: "round", join: "round" },
         itemStyle: { color },
-        emphasis: { focus: "series", lineStyle: { width: 2.6 } },
+        ...(area ? { areaStyle: { origin: "start", color: { type: "linear", x: 0, y: 0, x2: 0, y2: 1,
+          colorStops: [{ offset: 0, color: alpha(color, 0.18) }, { offset: 1, color: alpha(color, 0) }] } } } : {}),
+        emphasis: { focus: "series", lineStyle: { width: 2.8 } },
         blur: { lineStyle: { opacity: 0.25 }, itemStyle: { opacity: 0.25 } },
         z: rightAxis ? 3 : 2,
       };

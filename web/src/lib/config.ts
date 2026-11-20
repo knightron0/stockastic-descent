@@ -16,6 +16,7 @@ export const LOSS_RUNS = RUNS.filter(r => PRICE_SOURCE[r]);
 export const PRICED_RUNS = LOSS_RUNS.filter(r => !REPLAY || r !== "ANT");
 
 export const TOTAL_STEPS = 9375;
+export const TOKENS_PER_STEP = 64 * 1024;   // BATCH_SIZE x SEQ_LEN in stocklr/train.py
 export const ETA0 = 3e-3;
 export const WARMUP = 94;
 export const DECAY_START = 7500;

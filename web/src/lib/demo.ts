@@ -43,7 +43,7 @@ export function demoData(): Raw {
         const ts = src ? bars[src][bi].ts : new Date(a + ((b - a) * i) / 240).toISOString();
         const drift = 0.004 * Math.sin(step / 700 + offset[r] * 300);
         steps.push({ run: PREFIX + r, step, ts, lr: ETA0 * wsd(step) * m, lr_mult: m, train_loss: loss + offset[r] + drift + 0.05 * gauss(), job_id: j + 1 });
-        if (ranEval && i === 239) evals.push({ run: PREFIX + r, step, ts: new Date(b + 17 * 60e3).toISOString(), val_loss: loss + offset[r] + drift + 0.012 });
+        if (ranEval && i % 60 === 59) evals.push({ run: PREFIX + r, step, ts: new Date(b + 17 * 60e3).toISOString(), val_loss: loss + offset[r] + drift + 0.012 });
       }
     }
     jobs.push({ id: j + 1, window_start: new Date(a).toISOString(), window_end: new Date(b).toISOString(), status: "ok",
