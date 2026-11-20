@@ -81,7 +81,7 @@ h1 { font-size: clamp(26px, 3.2vw, 34px); font-weight: 700; letter-spacing: -0.0
 /* leaderboard / legend */
 .standings { display: flex; flex-direction: column; }
 .standings ol { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-.standings li { display: grid; grid-template-columns: 22px 18px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+.standings li { display: grid; grid-template-columns: 22px 18px auto minmax(0, 1fr) auto; align-items: center; gap: 10px;
   padding: clamp(6px, 1.3vh, 11px) 10px; border-radius: 10px; font-size: 15px; font-variant-numeric: tabular-nums;
   transition: background-color .3s; }
 .standings li.leader { background: color-mix(in srgb, var(--c) 8%, var(--panel)); font-weight: 600; }
@@ -94,25 +94,34 @@ h1 { font-size: clamp(26px, 3.2vw, 34px); font-weight: 700; letter-spacing: -0.0
 .standings .swatch { width: 18px; height: 3px; border-radius: 2px; background: var(--c); }
 .standings .name { color: var(--c); font-weight: 600; }
 .standings .score { text-align: right; font-family: var(--f-mono); font-size: 14px; font-weight: 500; }
-.standings .move { display: inline-block; font-size: 10.5px; font-weight: 600; margin-left: 8px; padding: 1px 6px; border-radius: 99px; vertical-align: 1px; }
+.standings .move { justify-self: start; font-size: 10.5px; font-weight: 600; padding: 1px 6px; border-radius: 99px; line-height: 1.5; }
+.standings .move.none { padding: 0; }
 .standings .move.up { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
 .standings .move.down { color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, transparent); }
 .standings .note { margin: auto 0 0; padding: 12px 2px 6px; color: var(--ink-3); font-size: 12px; line-height: 1.5; border-top: 1px solid var(--grid); }
 @media (max-width: 960px) {
   .standings ol { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; }
-  .standings li { grid-template-columns: auto minmax(0, 1fr); grid-template-areas: "rank name" "score score"; row-gap: 2px; padding: 8px 10px; background: var(--bg); }
+  .standings li { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "rank name name" "score score move";
+    column-gap: 6px; row-gap: 4px; padding: 8px 10px; background: var(--bg); -webkit-tap-highlight-color: transparent; }
+  .standings .move { grid-area: move; justify-self: end; }
   .standings .rank { grid-area: rank; } .standings .swatch { display: none; }
-  .standings .name { grid-area: name; } .standings .score { grid-area: score; text-align: left; font-size: 16px; }
+  .standings .name { grid-area: name; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .standings .score { grid-area: score; text-align: left; font-size: 15px; }
   .standings .note { display: none; }
 }
 @media (max-width: 700px) {
   .standings .panel-head { display: none; }
+  .panel.standings { background: none; border: 0; box-shadow: none; padding: 0; }   /* cards stand on their own */
+  .standings li { background: var(--panel); box-shadow: var(--shadow); border: 1px solid var(--rule); }
+  .standings li.leader { background: color-mix(in srgb, var(--c) 8%, var(--panel)); }
   h1 { font-size: 24px; }
   .standings ol { gap: 4px; margin: 0; }
-  .standings li { padding: 4px 7px; font-size: 13px; column-gap: 5px; }
-  .standings .score { font-size: 14px; }
+  .standings li { padding: 7px 8px; font-size: 13px; column-gap: 5px; row-gap: 3px; }
+  .standings .rank { width: 18px; height: 18px; font-size: 10.5px; }
+  .standings .score { font-size: 13px; }
+  .standings .move { font-size: 9.5px; padding: 0 4px; }
   .standings .panel-head { min-height: 0; margin-bottom: 4px; }
-  .seg button { padding: 2px 8px; }
+  .seg button { padding: 5px 10px; }
   .seg-label { display: none; }
 }
 

@@ -153,10 +153,13 @@
               {@const rank = standings.rows.findIndex(other => other.loss === row.loss) + 1}
               <li class:leader={rank === 1} class:hot={hovered === row.run} class:dim={hovered != null && hovered !== row.run}
                   style:--c={`var(${COLOR_VAR[row.run]})`} title={"Validation loss: " + row.loss}
-                  onmouseenter={() => (hovered = row.run)} onmouseleave={() => (hovered = null)}>
+                  onpointerenter={e => { if (e.pointerType === "mouse") hovered = row.run; }}
+                  onpointerleave={e => { if (e.pointerType === "mouse") hovered = null; }}
+                  onpointerup={e => { if (e.pointerType !== "mouse") hovered = hovered === row.run ? null : row.run; }}>
                 <span class="rank" aria-label={`Rank ${rank}`}>{rank}</span>
                 <span class="swatch" aria-hidden="true"></span>
-                <span class="name">{PRICE_SOURCE[row.run]}{#if standings.moved[row.run] > 0}<span class="move up" title="Up {standings.moved[row.run]} since step {standings.since?.toLocaleString()}">▲{standings.moved[row.run]}</span>{:else if standings.moved[row.run] < 0}<span class="move down" title="Down {-standings.moved[row.run]} since step {standings.since?.toLocaleString()}">▼{-standings.moved[row.run]}</span>{/if}</span>
+                <span class="name">{PRICE_SOURCE[row.run]}</span>
+                {#if standings.moved[row.run] > 0}<span class="move up" title="Up {standings.moved[row.run]} since step {standings.since?.toLocaleString()}">▲{standings.moved[row.run]}</span>{:else if standings.moved[row.run] < 0}<span class="move down" title="Down {-standings.moved[row.run]} since step {standings.since?.toLocaleString()}">▼{-standings.moved[row.run]}</span>{:else}<span class="move none"></span>{/if}
                 <span class="score">{row.loss.toFixed(3)}</span>
               </li>
             {/each}

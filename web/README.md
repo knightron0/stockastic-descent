@@ -29,6 +29,9 @@ Vercel builds `web/` on every push to `main`. Project settings: Root Directory `
 build `npm run build`, output `dist`), env vars `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (the
 publishable key, never the service key). Custom domain: Settings → Domains, then add the DNS records it shows.
 
+Enable Web Analytics in the Vercel project before deploying. Production visits appear in the project's
+Analytics tab. Local builds, preview deployments, and visits with `?demo` skip tracking.
+
 ## Layout
 ```
 src/App.svelte            the page: header, progress, validation loss + leaderboard, training loss, price/LR
