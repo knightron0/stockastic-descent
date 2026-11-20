@@ -24,14 +24,10 @@ URL flags:
 
 Other scripts: `npm run check` (svelte-check / types), `npm run build` (→ `dist/`), `npm run preview`.
 
-## Deploy (GitHub Pages)
-`.github/workflows/deploy-web.yml` builds `web/` and publishes it on every push to `main` that touches `web/`.
-One-time setup in the repo:
-1. **Settings → Pages → Source: GitHub Actions.**
-2. **Settings → Secrets and variables → Actions:** add `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.
-
-`vite.config.ts` uses `base: "./"`, so the build works from the `/<repo>/` sub-path. The site is a static
-bundle, so Vercel/Netlify also work (root directory `web`, build `npm run build`, output `dist`, same env vars).
+## Deploy (Vercel)
+Vercel builds `web/` on every push to `main`. Project settings: Root Directory `web` (Vite is auto-detected:
+build `npm run build`, output `dist`), env vars `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` (the
+publishable key, never the service key). Custom domain: Settings → Domains, then add the DNS records it shows.
 
 ## Layout
 ```

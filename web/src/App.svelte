@@ -18,7 +18,6 @@
   const initialSmooth = Number(params.get("smooth") ?? 100);
   let view = $state<"zoom" | "full">(params.get("view") === "full" ? "full" : "zoom");
   let smooth = $state([1, 20, 100, 400].includes(initialSmooth) ? initialSmooth : 100);
-  const tweetUrl = "https://twitter.com/intent/tweet?" + new URLSearchParams({ text: "Stockastic Descent", url: location.origin + location.pathname });
 
   const model = $derived(raw ? shape(raw) : null);
   const dataThrough = $derived(raw?.steps.reduce((latest, row) => {
@@ -184,8 +183,4 @@
       </section>
     </div>
 
-  <footer>
-    <a href="https://github.com/knightron0/stock-lr">GitHub</a>
-    <a href={tweetUrl}>Share</a>
-  </footer>
 </main>
