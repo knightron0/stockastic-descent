@@ -73,7 +73,34 @@ class Constant:
         return lr, mult
 
 
-SCHEDULES = {"wsd": WSD, "envelope": Envelope, "constant": Constant}
+class Alchemy:
+    """Port of deep-learning-alchemy/assignments lr_schedules.py (const / wsd<frac> / linear), with its
+    defaults: warmup_steps = int(total * 0.01) = 93, linear from 0; the scheduler counts from 0, so the
+    first optimizer step uses lr 0. Here every kind gets the warmup (their ConstantScheduler has none)."""
+    def __init__(self, kind, eta0=ETA0, warmup_percent=0.01, decay_fraction=0.2, total_steps=TOTAL_STEPS):
+        if kind not in ("const", "wsd", "linear"):
+            raise ValueError(f"unknown kind {kind!r}")
+        self.kind, self.eta0, self.N = kind, float(eta0), int(total_steps)
+        self.W = int(self.N * warmup_percent)
+        self.stable_end = self.N - int(self.N * decay_fraction)
+
+    def __call__(self, step, mult, state):
+        t = step - 1                                   # their last_epoch at this optimizer step
+        if t < self.W:
+            f = t / self.W
+        elif self.kind == "const":
+            f = 1.0
+        else:
+            start = self.W if self.kind == "linear" else self.stable_end
+            f = 1.0 if t < start else 1 - min(1.0, (t - start) / max(1, self.N - start))
+        return self.eta0 * f * mult, mult
+
+
+SCHEDULES = {"wsd": WSD, "envelope": Envelope, "constant": Constant, "alchemy": Alchemy}
+
+# Plain-schedule baselines matching the course repo's recipe (no stock signal, multiplier fixed at 1). Same init seed and batch order as the
+# stock runs. Launched with `modal run modal_app.py::baselines`.
+BASELINE_SCHEDULES = {k: {"name": "alchemy", "kind": k} for k in ("const", "wsd", "linear")}
 
 
 def build_schedule(spec: dict):

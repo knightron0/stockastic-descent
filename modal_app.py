@@ -426,6 +426,46 @@ def backfill_day(day: str):
         print(r)
 
 
+@app.function(image=image, gpu="H100", volumes={VOL: vol}, timeout=4 * 3600, retries=2)
+def baseline_run(name: str, chunk: int = 600):
+    """One full plain-schedule run (stocklr.lr.BASELINE_SCHEDULES[name]), mult fixed at 1, same seed and batch
+    order as the stock runs. Checkpoints + log under /vol/baselines/ after every chunk, so a retry resumes.
+    Touches neither Supabase nor the cron's checkpoints."""
+    import json, os
+    from stocklr.lr import BASELINE_SCHEDULES, TOTAL_STEPS, build_schedule
+    from stocklr.train import Tokens, commit_checkpoints, train_window
+    d = f"{VOL}/baselines"
+    os.makedirs(d, exist_ok=True)
+    log_path = f"{d}/{name}.json"
+    log = json.load(open(log_path)) if os.path.exists(log_path) else {"schedule": BASELINE_SCHEDULES[name], "steps": [], "evals": []}
+    sched, tokens = build_schedule(BASELINE_SCHEDULES[name]), Tokens(f"{VOL}/data")
+    t0 = time.perf_counter()
+    while True:
+        res = train_window(name, [1.0] * chunk, sched, tokens, d, True, EVAL_EVERY)
+        if res["done"]:
+            break
+        s0 = res["start_step"]                       # resume: drop log rows past the checkpoint
+        log["steps"] = [r for r in log["steps"] if r[0] <= s0]; log["evals"] = [e for e in log["evals"] if e[0] <= s0]
+        log["steps"] +=[[s, lr, loss] for s, lr, _, loss in res["steps"]]
+        log["evals"] += res["evals"]
+        json.dump(log, open(f"{log_path}.tmp", "w")); os.replace(f"{log_path}.tmp", log_path)
+        commit_checkpoints(d, [name]); vol.commit()
+        print(f"{name}: step {res['end_step']}/{TOTAL_STEPS}  lr {res['steps'][-1][1]:.2e}  val {res['val_loss']:.4f}"
+              f"  ({res['ms_per_step']:.0f} ms/step, {time.perf_counter() - t0:.0f}s so far)", flush=True)
+    return log
+
+
+@app.local_entrypoint()
+def baselines(names: str = "const,wsd,linear"):
+    """uv run modal run --detach modal_app.py::baselines   -> three H100s in parallel, logs to research/baselines/"""
+    import json, pathlib
+    out = pathlib.Path("research/baselines"); out.mkdir(parents=True, exist_ok=True)
+    names = names.split(",")
+    for n, log in zip(names, baseline_run.map(names)):
+        (out / f"{n}.json").write_text(json.dumps(log))
+        print(f"{n}: final val {log['evals'][-1][1]:.4f} -> {out / n}.json")
+
+
 TABLES = ["jobs", "prices", "steps", "evals"]
 
 

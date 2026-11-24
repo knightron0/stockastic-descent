@@ -114,3 +114,19 @@ def test_constant_schedule_clips_lr():
     assert c(1, 1.1, {})[0] == pytest.approx(3.3e-3)
     capped = L.build_schedule({**SCHEDULE, "max_lr": 6e-3})
     assert capped(1, 5.0, {})[0] == 6e-3
+
+
+def test_baseline_schedules():
+    s = {k: L.build_schedule(v) for k, v in L.BASELINE_SCHEDULES.items()}
+    N, W = L.TOTAL_STEPS, 93                              # int(9375 * 0.01)
+    lr = lambda k, step: s[k](step, 1.0, {})[0]
+    for k in s:                                           # every baseline warms up from 0 over 93 steps
+        assert lr(k, 1) == 0.0
+        assert lr(k, 2) == pytest.approx(L.ETA0 / W)
+        assert lr(k, W + 1) == pytest.approx(L.ETA0)
+    assert lr("const", N) == pytest.approx(L.ETA0)
+    assert lr("wsd", 7500) == pytest.approx(L.ETA0) and lr("wsd", 7501) == pytest.approx(L.ETA0)
+    assert lr("wsd", 7502) < L.ETA0
+    assert lr("linear", N) == pytest.approx(L.ETA0 / (N - W))   # their last step: one notch above 0
+    lin = [lr("linear", t) for t in range(W + 1, N + 1)]
+    assert all(a > b for a, b in zip(lin, lin[1:]))
