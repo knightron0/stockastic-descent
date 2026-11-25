@@ -20,10 +20,10 @@ function alpha(hex: string, a: number) {
 }
 
 /** Padded [min, max] of the series values whose step lies in [lo, hi]. */
-function fitY(spec: ChartSpec, lo: number, hi: number): [number, number] | null {
+function fitY(spec: ChartSpec, lo: number, hi: number, rightAxis = false): [number, number] | null {
   let min = Infinity, max = -Infinity;
   for (const s of spec.series) {
-    if (s.rightAxis) continue;
+    if (Boolean(s.rightAxis) !== rightAxis) continue;
     for (let j = Math.max(0, lo - 1); j < Math.min(s.data.length, hi); j++) {
       const v = s.data[j];
       if (v == null) continue;
@@ -46,6 +46,8 @@ export function buildOption(spec: ChartSpec, model: Model) {
   const axisLine = { show: true, onZero: false, lineStyle: { color: c.rule, width: 1 } };
   const [xMin, xMax] = spec.xRange ?? [1, TOTAL_STEPS];
   const yFit = spec.focus ? fitY(spec, xMin, xMax) : null;
+
+  const rightFit = spec.rightFmt ? fitY(spec, xMin, xMax, true) : null;
 
   return {
     animation: false,
@@ -84,8 +86,9 @@ export function buildOption(spec: ChartSpec, model: Model) {
 
     }, ...(spec.rightFmt ? [{
       type: "value", position: "right", scale: true, splitNumber: 4, boundaryGap: ["4%", "4%"],
+      ...(rightFit ? { min: Math.max(0, rightFit[0]), max: rightFit[1] } : {}),
       splitLine: { show: false }, axisLine, axisTick: { show: false },
-      axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, formatter: spec.rightFmt },
+      axisLabel: { color: c.ink3, fontFamily: mono, fontSize: 11, margin: 10, hideOverlap: true, showMinLabel: rightFit ? rightFit[0] <= 0 : true, showMaxLabel: !rightFit, formatter: spec.rightFmt },
     }] : [])],
     series: spec.series.map(({ run, data, name, rightAxis, area }) => {
       const color = rightAxis ? c.ink3 : css(COLOR_VAR[run]);

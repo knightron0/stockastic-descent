@@ -101,19 +101,29 @@ def test_live_formula_is_peak_times_price_over_start():
     p = np.array([100.0, 110.0, 95.0, 100.0])
     m = M.safe_multipliers(M.build(TICKER_MAPPER), M.Bars(np.arange(4), p, np.ones(4)))
     sched = L.build_schedule(SCHEDULE)
-    lrs = [sched(i + 1, v, {})[0] for i, v in enumerate(m)]
+    lrs = [sched(i + 94, v, {})[0] for i, v in enumerate(m)]
     assert np.allclose(lrs, 3e-3 * p / p[0])
+
+
+def test_live_warmup_matches_trial_schedule():
+    from stocklr.config import SCHEDULE
+    live = L.build_schedule(SCHEDULE)
+    trial = L.Alchemy("const", eta0=1.0)
+    for step in (1, 2, 60, 61, 93, 94, 4801):
+        for mult in (0.0, 0.9, 2.0):
+            expected, _ = trial(step, max(1e-6, 3e-3 * mult), {})
+            assert live(step, mult, {}) == (expected, mult)
 
 
 def test_constant_schedule_clips_lr():
     from stocklr.config import SCHEDULE
     c = L.build_schedule(SCHEDULE)
-    assert c(1, 0.0, {})[0] == 1e-6            # price -> 0: floor
-    assert c(1, 1e-9, {})[0] == 1e-6
-    assert c(1, 5.0, {})[0] == pytest.approx(1.5e-2)   # price x5: no ceiling
-    assert c(1, 1.1, {})[0] == pytest.approx(3.3e-3)
+    assert c(94, 0.0, {})[0] == 1e-6            # price -> 0: floor
+    assert c(94, 1e-9, {})[0] == 1e-6
+    assert c(94, 5.0, {})[0] == pytest.approx(1.5e-2)   # price x5: no ceiling
+    assert c(94, 1.1, {})[0] == pytest.approx(3.3e-3)
     capped = L.build_schedule({**SCHEDULE, "max_lr": 6e-3})
-    assert capped(1, 5.0, {})[0] == 6e-3
+    assert capped(94, 5.0, {})[0] == 6e-3
 
 
 def test_baseline_schedules():

@@ -246,8 +246,8 @@ def test_job(start_iso: str, end_iso: str, keep: bool = False):
             f"4 runs x {STEPS_PER_JOB // EVAL_EVERY} evals": len(evals) == 4 * (STEPS_PER_JOB // EVAL_EVERY),
             "bars pulled": sum((status[1] or {}).values()) > 0,
             "mapper specs recorded": q("select mappers is not null from jobs where id=%s")[0][0],
-            "lr >= 1e-6": all(1e-6 <= r[4] for r in steps),
-            "lr positive": all(0 < r[4] for r in steps),
+            "zero LR only on step one": q("select count(*) from steps where job_id=%s and "
+                                           "((step=1 and lr<>0) or (step>1 and lr<=0))")[0][0] == 0,
         }
         if not keep:
             db.delete_job(conn, jid)

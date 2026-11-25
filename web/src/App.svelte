@@ -70,10 +70,10 @@
     const market: ChartSpec = {
       series: [
         { run: ticker, name: "Closing price", data: model.close[ticker], area: true },
-        { run: ticker, name: "Learning rate (×10⁻³)", data: model.lr[ticker], rightAxis: true },
+        { run: ticker, name: "Learning rate", data: model.lr[ticker], rightAxis: true },
       ],
       yFmt: v => "$" + Number(v.toFixed(2)),
-      rightFmt: v => String(Number(v.toFixed(2))),
+      rightFmt: v => String(Number((v / 1000).toFixed(6))),
       xRange,
     };
     return { train, val, market };
@@ -208,7 +208,7 @@
         <div class="panel-head">
           <div class="axis-key">
             <span style:--series-color={`var(${COLOR_VAR[ticker]})`}><strong>{PRICE_SOURCE[ticker]}</strong>&nbsp;price</span>
-            <span class="dashed">Learning rate (×10⁻³)</span>
+            <span class="dashed">Learning rate</span>
           </div>
           <div class="seg" role="group" aria-label="Price and learning rate ticker">
             {#each PRICED_RUNS as run}

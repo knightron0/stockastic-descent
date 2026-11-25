@@ -10,8 +10,8 @@ TICKER_MAPPER = {"name": "price_ratio", "k": 1.0, "smooth": 1}
 
 MAPPER_SPECS = {t: TICKER_MAPPER for t in TICKERS}
 
-# LR floor 1e-6, no ceiling.
-SCHEDULE = {"name": "constant", "peak_lr": 3e-3, "min_lr": 1e-6, "max_lr": None}
+# Warm up the clipped stock LR from zero on step 1 to full strength on step 94.
+SCHEDULE = {"name": "constant", "peak_lr": 3e-3, "min_lr": 1e-6, "max_lr": None, "warmup_steps": 93}
 
 # History fed to the mapper starts this many days before the run's first job. price_ratio divides by the
 # first bar it sees, so 0 makes that the run's starting price. (ema_sigmoid needs 30.)

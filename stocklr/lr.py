@@ -61,15 +61,18 @@ class Envelope:
 
 
 class Constant:
-    """lr = clip(peak_lr * multiplier, min_lr, max_lr). No warmup, no decay, stateless. max_lr=None: no ceiling."""
-    def __init__(self, peak_lr=3e-3, min_lr=1e-6, max_lr=None):
+    """Clipped stock LR with optional zero-start linear warmup, then no decay."""
+    def __init__(self, peak_lr=3e-3, min_lr=1e-6, max_lr=None, warmup_steps=0):
         self.peak_lr, self.min_lr = float(peak_lr), float(min_lr)
         self.max_lr = None if max_lr is None else float(max_lr)
+        self.warmup_steps = warmup_steps
 
     def __call__(self, step, mult, state):
         lr = max(self.peak_lr * mult, self.min_lr)
         if self.max_lr is not None:
             lr = min(lr, self.max_lr)
+        if self.warmup_steps and step <= self.warmup_steps:
+            lr *= (step - 1) / self.warmup_steps
         return lr, mult
 
 
