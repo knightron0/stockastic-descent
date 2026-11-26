@@ -1,5 +1,5 @@
 from datetime import date, datetime, timezone
-from stocklr.market import ET, fetch_bars, job_window, job_windows_for_day
+from stocklr.market import ET, fetch_bars, is_regular_session, job_window, job_windows_for_day
 
 
 def et(*a):
@@ -33,6 +33,25 @@ def test_cron_fires_map_to_26_full_windows():
     assert all(wins[i][1] == wins[i + 1][0] for i in range(len(wins) - 1))
     assert wins == job_windows_for_day(date(2026, 11, 19))
     assert job_windows_for_day(date(2026, 11, 21)) == []
+
+
+def test_holiday_has_no_windows():
+    # Thanksgiving, Thu 2026-11-26: every cron fire finds nothing to do
+    assert job_windows_for_day(date(2026, 11, 26)) == []
+    assert all(job_window(et(2026, 11, 26, h, m)) is None for h in range(10, 17) for m in (2, 17, 32, 47))
+    assert not is_regular_session(et(2026, 11, 26, 12, 0))
+
+
+def test_early_close_stops_at_1pm():
+    # Fri 2026-11-27 closes at 13:00 ET: 14 windows, the last is 12:45-13:00, after-hours bars are dropped
+    wins = job_windows_for_day(date(2026, 11, 27))
+    assert len(wins) == 14
+    assert wins[-1][1].astimezone(ET).strftime("%H:%M") == "13:00"
+    assert job_window(et(2026, 11, 27, 13, 17)) is not None      # trains 12:45-13:00
+    assert job_window(et(2026, 11, 27, 13, 32)) is None
+    assert is_regular_session(et(2026, 11, 27, 12, 59))
+    assert not is_regular_session(et(2026, 11, 27, 13, 0))
+    assert len(job_windows_for_day(date(2026, 11, 30))) == 26     # Monday is a full day again
 
 
 def test_dst_is_handled():
